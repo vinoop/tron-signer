@@ -1,106 +1,81 @@
-// signer-debug.js  (temporary debug version)
+// signer.js  — production safe
 require('dotenv').config();
 const express = require('express');
 const bodyParser = require('body-parser');
 const TronWeb = require('tronweb');
 
 const app = express();
-
-// parse JSON and also raw text fallback
 app.use(bodyParser.json({ limit: '5mb' }));
-app.use(bodyParser.text({ type: '*/*', limit: '5mb' })); // fallback if content-type not json
 
-// load env
-const SECRET = process.env.SIGNER_SECRET || 'super_signer_secret_here';
+const SECRET = process.env.SIGNER_SECRET;
 const PRIVATE_KEY = process.env.SIGNER_PRIVATE_KEY;
-const TRONGRID = process.env.TRONGRID_BASE || 'https://api.shasta.trongrid.io';
+const TRONGRID = process.env.TRONGRID_BASE || 'https://api.trongrid.io';
 const PORT = process.env.PORT || 3000;
 
-// Basic health endpoint
-app.get('/', (req, res) => res.json({ status: 'signer-debug-up' }));
+if (!SECRET || !PRIVATE_KEY) {
+  console.error('Missing SIGNER_SECRET or SIGNER_PRIVATE_KEY in environment. Exiting.');
+  process.exit(1);
+}
 
-// The debug /sign endpoint
+const tronWeb = new TronWeb({ fullHost: TRONGRID, privateKey: PRIVATE_KEY });
+
+// health
+app.get('/', (req, res) => res.json({ status: 'signer-up' }));
+
 app.post('/sign', async (req, res) => {
   try {
-    // Log headers for debugging (Render logs)
-    console.log('--- NEW /sign request ---');
-    console.log('headers:', JSON.stringify(req.headers));
+    // auth
+    if (req.header('X-SIGNER-SECRET') !== SECRET) {
+      return res.status(403).json({ error: 'invalid_signer_secret' });
+    }
 
-    // Try to get parsed body. If bodyParser.json worked, req.body is object.
-    let body = req.body;
-    if (!body || typeof body === 'string') {
-      // if it's string, attempt to parse JSON
-      if (typeof body === 'string') {
-        try {
-          body = JSON.parse(body);
-        } catch (e) {
-          // If not JSON, attempt to read raw text from req (already in req.body)
-          console.log('raw body string (non-json):', body);
-          body = {};
-        }
-      } else {
-        body = {};
+    // accept many names (backwards compat)
+    const body = req.body || {};
+    const from = body.from || body.from_address;
+    const to   = body.to   || body.to_address || body.company;
+    let amountSun = body.amountSun || body.amount_sun || body.trx_amount || body.trxAmount;
+    const tokenContract = body.tokenContract || body.token_contract;
+    const tokenAmount = body.tokenAmount || body.token_amount;
+
+    if (!from || !to || (!amountSun && !tokenContract)) {
+      return res.status(400).json({ error: 'missing_parameters' });
+    }
+
+    // normalize
+    if (typeof amountSun === 'string') amountSun = amountSun.trim();
+
+    // TRC20 transfer
+    if (tokenContract && tokenAmount) {
+      try {
+        const contract = await tronWeb.contract().at(tokenContract);
+        // tokenAmount must be in smallest units (string or number)
+        const tx = await contract.transfer(to, tokenAmount).send();
+        // contract.transfer returns tx info or txid depending on node/contract; normalize
+        return res.json({ status: 'ok', type: 'trc20', tx: tx });
+      } catch (err) {
+        console.error('TRC20 send error:', err && err.toString ? err.toString() : err);
+        return res.status(500).json({ error: 'trc20_error', detail: err.toString ? err.toString() : String(err) });
       }
     }
 
-    console.log('parsed body:', JSON.stringify(body));
+    // TRX transfer
+    try {
+      const amountTRX = Number(amountSun) / 1e6;
+      const tx = await tronWeb.transactionBuilder.sendTrx(to, amountTRX, from);
+      const signed = await tronWeb.trx.sign(tx, PRIVATE_KEY);
+      const result = await tronWeb.trx.sendRawTransaction(signed);
 
-    // Accept many possible field names used by different clients
-    const from = body.from || body.from_address || body.address || body.source || body.sender;
-    const to   = body.to   || body.to_address || body.company || body.destination || body.recipient;
-    let amountSun = body.amountSun || body.amount_sun || body.trx_amount || body.trxAmount || body.amount || body.value;
-    const tokenContract = body.tokenContract || body.token_contract || body.contract || body.token;
-    const tokenAmount = body.tokenAmount || body.token_amount || body.token_amount_units || body.token_value || body.tokenValue;
-
-    // Print what we resolved
-    console.log('resolved -> from:', from, 'to:', to, 'amountSun:', amountSun, 'tokenContract:', tokenContract, 'tokenAmount:', tokenAmount);
-
-    // If missing, respond with debug payload so caller can see what to change
-    if (!from || !to || (!amountSun && !tokenContract)) {
-      // Return the body we parsed so you can inspect keys and values
-      return res.status(400).json({
-        error: 'missing_parameters',
-        message: 'Required fields not found. See "received" for what the server parsed.',
-        received: {
-          rawHeaders: req.headers,
-          parsedBody: body,
-          resolved: { from, to, amountSun, tokenContract, tokenAmount }
-        }
-      });
+      // result often contains {result: true, txid: '...'} or other structure
+      return res.json({ status: 'ok', type: 'trx', result: result });
+    } catch (err) {
+      console.error('TRX send error:', err && err.toString ? err.toString() : err);
+      return res.status(500).json({ error: 'trx_error', detail: err.toString ? err.toString() : String(err) });
     }
 
-    // Normalize amountSun to number/string
-    amountSun = typeof amountSun === 'string' ? amountSun.trim() : amountSun;
-
-    // If you want to test signature path without actually broadcasting, respond with ok
-    // (For debugging we will not sign/broadcast automatically)
-    return res.json({
-      status: 'debug_ok',
-      message: 'Request parsed successfully (debug mode). Replace with signing logic after confirming fields.',
-      resolved: { from, to, amountSun, tokenContract, tokenAmount }
-    });
-
-    // ---------- production signing code (commented out during debug) ----------
-    // if (!PRIVATE_KEY) {
-    //   return res.status(500).json({ error: 'missing_private_key' });
-    // }
-    // const tronWeb = new TronWeb({ fullHost: TRONGRID, privateKey: PRIVATE_KEY });
-    // if (tokenContract && tokenAmount) {
-    //   const contract = await tronWeb.contract().at(tokenContract);
-    //   const txResult = await contract.transfer(to, tokenAmount).send();
-    //   return res.json({ status: 'ok', result: txResult });
-    // } else {
-    //   const tx = await tronWeb.transactionBuilder.sendTrx(to, amountSun / 1e6, from);
-    //   const signed = await tronWeb.trx.sign(tx, PRIVATE_KEY);
-    //   const result = await tronWeb.trx.sendRawTransaction(signed);
-    //   return res.json({ status: 'ok', result });
-    // }
-
   } catch (err) {
-    console.error('signer-debug error:', err);
-    return res.status(500).json({ error: 'server_error', detail: err.toString() });
+    console.error('signer unexpected error:', err);
+    return res.status(500).json({ error: 'server_error', detail: err.toString ? err.toString() : String(err) });
   }
 });
 
-// start
-app.listen(PORT, () => console.log(`Signer DEBUG running on port ${PORT}`));
+app.listen(PORT, () => console.log(`Signer running on port ${PORT}`));
