@@ -1,147 +1,59 @@
-// signer.js  — production safe (updated with robust TRC20 send + better logging)
-require('dotenv').config();
+// signer.js — minimal Tron signer service
 const express = require('express');
 const bodyParser = require('body-parser');
 const TronWeb = require('tronweb');
 
-const app = express();
-app.use(bodyParser.json({ limit: '5mb' }));
-
-const SECRET = process.env.SIGNER_SECRET;
-const PRIVATE_KEY = process.env.SIGNER_PRIVATE_KEY;
-const TRONGRID = process.env.TRONGRID_BASE || 'https://api.trongrid.io';
+const APP_SECRET = process.env.SIGNER_SECRET || ''; // set in Render env
 const PORT = process.env.PORT || 3000;
 
-if (!SECRET || !PRIVATE_KEY) {
-  console.error('Missing SIGNER_SECRET or SIGNER_PRIVATE_KEY in environment. Exiting.');
-  process.exit(1);
-}
+const app = express();
+app.use(bodyParser.json({ limit: '8mb' }));
 
-const tronWeb = new TronWeb({ fullHost: TRONGRID, privateKey: PRIVATE_KEY });
+// Health
+app.get('/', (req, res) => res.send('Tron signer alive'));
 
-// ----------------------
-// Helper: robust TRC20 transfer
-// Builds triggerSmartContract, signs, broadcasts.
-// ----------------------
-async function sendTrc20(from, to, tokenContract, tokenAmount) {
-  if (!tokenAmount) throw new Error('tokenAmount empty');
-  // feeLimit in SUN (100_000_000 = 100 TRX) — tune lower after testing
-  const feeLimit = 100_000_000;
-
-  // Convert contract address to hex without 0x
-  const contractHex = tronWeb.address.toHex(tokenContract).replace(/^0x/, '');
-
-  // Function selector: transfer(address,uint256)
-  const functionSelector = 'transfer(address,uint256)';
-
-  const params = [
-    { type: 'address', value: to },
-    { type: 'uint256', value: tokenAmount.toString() }
-  ];
-
-  // triggerSmartContract returns an object with `transaction` (unsigned)
-  const txObj = await tronWeb.transactionBuilder.triggerSmartContract(
-    contractHex,
-    functionSelector,
-    { feeLimit: feeLimit },
-    params,
-    from
-  );
-
-  if (!txObj || !txObj.transaction) {
-    throw new Error('triggerSmartContract returned no transaction object: ' + JSON.stringify(txObj));
-  }
-
-  // sign
-  const signed = await tronWeb.trx.sign(txObj.transaction, PRIVATE_KEY);
-  if (!signed) throw new Error('Signing failed');
-
-  // broadcast
-  const broadcast = await tronWeb.trx.sendRawTransaction(signed);
-  return broadcast;
-}
-
-// health
-app.get('/', (req, res) => res.json({ status: 'signer-up' }));
-
+// Sign endpoint
 app.post('/sign', async (req, res) => {
   try {
-    // auth
-    if (req.header('X-SIGNER-SECRET') !== SECRET) {
+    // Authenticate with X-SIGNER-SECRET
+    const headerSecret = (req.header('X-SIGNER-SECRET') || '').trim();
+    if (!APP_SECRET || !headerSecret || headerSecret !== APP_SECRET) {
       return res.status(403).json({ error: 'invalid_signer_secret' });
     }
 
-    // accept many names (backwards compat)
+    // Accept many shapes
     const body = req.body || {};
-    const from = body.from || body.from_address;
-    const to   = body.to   || body.to_address || body.company;
-    let amountSun = body.amountSun || body.amount_sun || body.trx_amount || body.trxAmount;
-    const tokenContract = body.tokenContract || body.token_contract || body.contract;
-    const tokenAmount = body.tokenAmount || body.token_amount || body.amount_in_base || body.amount;
+    const privateKey = (body.privateKey || body.private_key || body.pk || '').trim();
+    const txObj = body.transaction || body.tx || body.raw_data || null;
+    const rawHex = body.raw_data_hex || body.txHex || body.transactionHex || null;
 
-    if (!from || !to || (!amountSun && !tokenContract)) {
-      return res.status(400).json({ error: 'missing_parameters' });
+    if (!privateKey) {
+      return res.status(400).json({ error: 'missing_parameters', message: 'private key required (privateKey or private_key)' });
     }
 
-    // normalize
-    if (typeof amountSun === 'string') amountSun = amountSun.trim();
-
-    // TRC20 transfer (use robust helper)
-    if (tokenContract && tokenAmount) {
-      try {
-        // Optional safety check: ensure signer private key corresponds to `from`
-        // If your architecture uses the signer hot wallet to sign only its own address, skip this.
-        try {
-          const signerAddr = tronWeb.address.fromPrivateKey(PRIVATE_KEY);
-          if (signerAddr && signerAddr !== from) {
-            // It's okay if signer is signing for other addresses only if you intentionally provided their key.
-            // If you want to enforce signer only signs for its own address, uncomment next lines:
-            // return res.status(403).json({ error: 'forbidden', detail: 'signer key does not match from address' });
-            // For now we log a warning:
-            console.warn('Warning: signer private key address %s does not match request from %s', signerAddr, from);
-          }
-        } catch (e) {
-          // ignore address-from-key check failures
-        }
-
-        const result = await sendTrc20(from, to, tokenContract, tokenAmount);
-        // result often contains { result: true, txid: "..." } or boolean; return it raw
-        return res.json({ status: 'ok', type: 'trc20', result });
-      } catch (err) {
-        // Improved error logging and return
-        try {
-          console.error('TRC20 send error - full:', JSON.stringify(err, Object.getOwnPropertyNames(err), 2));
-        } catch (e) {
-          console.error('TRC20 send error (string):', String(err));
-        }
-        const detail = err && err.message ? err.message : (typeof err === 'object' ? JSON.stringify(err) : String(err));
-        return res.status(500).json({ error: 'trc20_error', detail });
-      }
+    let txToSign = txObj;
+    if (!txToSign && rawHex) {
+      // If only raw hex provided, create a minimal object. TronWeb can sign if raw_data_hex is provided.
+      txToSign = { raw_data_hex: rawHex };
     }
 
-    // TRX transfer
-    try {
-      const amountTRX = Number(amountSun) / 1e6;
-      const tx = await tronWeb.transactionBuilder.sendTrx(to, amountTRX, from);
-      const signed = await tronWeb.trx.sign(tx, PRIVATE_KEY);
-      const result = await tronWeb.trx.sendRawTransaction(signed);
-
-      return res.json({ status: 'ok', type: 'trx', result: result });
-    } catch (err) {
-      try {
-        console.error('TRX send error - full:', JSON.stringify(err, Object.getOwnPropertyNames(err), 2));
-      } catch (e) {
-        console.error('TRX send error (string):', String(err));
-      }
-      const detail = err && err.message ? err.message : (typeof err === 'object' ? JSON.stringify(err) : String(err));
-      return res.status(500).json({ error: 'trx_error', detail });
+    if (!txToSign) {
+      return res.status(400).json({ error: 'missing_parameters', message: 'transaction or raw_data_hex required' });
     }
 
+    // Create TronWeb with public node (no private key here)
+    const tronWeb = new TronWeb({ fullHost: 'https://api.trongrid.io' });
+
+    // tronWeb.trx.sign accepts a transaction object (or raw_data_hex)
+    // It returns signed transaction (object with signature)
+    const signed = await tronWeb.trx.sign(txToSign, privateKey);
+
+    // Return signed object
+    return res.json(signed);
   } catch (err) {
-    console.error('signer unexpected error:', err && err.stack ? err.stack : err);
-    const detail = err && err.message ? err.message : (typeof err === 'object' ? JSON.stringify(err) : String(err));
-    return res.status(500).json({ error: 'server_error', detail });
+    console.error('Signer error:', err && err.stack ? err.stack : err);
+    return res.status(500).json({ error: 'internal_error', message: String(err && err.message ? err.message : err) });
   }
 });
 
-app.listen(PORT, () => console.log(`Signer running on port ${PORT}`));
+app.listen(PORT, () => console.log(`Signer listening on port ${PORT}`));
