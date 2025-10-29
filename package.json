@@ -1,18 +1,14 @@
 {
   "name": "tron-signer",
   "version": "1.0.0",
-  "description": "Simple Tron signer for TRX/TRC20 (tronweb)",
+  "description": "Minimal Tron signer for signing transactions (TronWeb)",
   "main": "signer.js",
   "scripts": {
     "start": "node signer.js"
   },
   "dependencies": {
-    "body-parser": "^1.20.2",
-    "dotenv": "^16.3.1",
     "express": "^4.18.2",
-    "tronweb": "^4.3.3"
-  },
-  "engines": {
-    "node": ">=18"
+    "body-parser": "^1.20.2",
+    "tronweb": "^4.3.2"
   }
 }
